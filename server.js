@@ -4,685 +4,640 @@ const socketIo = require('socket.io');
 const multer = require('multer');
 const path = require('path');
 const bodyParser = require('body-parser');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+const { createClient } = require('@supabase/supabase-js');
+require('dotenv').config();
 
 const app = express();
 const server = http.createServer(app);
 const io = socketIo(server, {
-    cors: { origin: '*' } // للسماح بالاتصال من أي مصدر
+    cors: { origin: '*' }
 });
+
+const JWT_SECRET = 'your-super-secret-jwt-key-change-this-in-production';
+
+const supabaseUrl = process.env.VITE_SUPABASE_URL;
+const supabaseKey = process.env.VITE_SUPABASE_ANON_KEY;
+const supabase = createClient(supabaseUrl, supabaseKey);
 
 app.use(bodyParser.json());
-app.use(express.static('Uploads')); // لخدمة الملفات (صور، صوت) من مجلد Uploads
+app.use(express.static('public'));
+app.use('/uploads', express.static('uploads'));
 
-// إعداد Multer لتخزين الملفات مع حد للحجم
 const storage = multer.diskStorage({
-    destination: (req, file, cb) => cb(null, 'Uploads/'),
+    destination: (req, file, cb) => cb(null, 'uploads/'),
     filename: (req, file, cb) => cb(null, Date.now() + path.extname(file.originalname))
 });
-const upload = multer({ 
+
+const upload = multer({
     storage,
-    limits: { fileSize: 5 * 1024 * 1024 }, // حد 5 ميغابايت
+    limits: { fileSize: 10 * 1024 * 1024 },
     fileFilter: (req, file, cb) => {
-        const filetypes = /jpeg|jpg|png|webm/;
+        const filetypes = /jpeg|jpg|png|webm|mp3|wav|mp4|gif/;
         const extname = filetypes.test(path.extname(file.originalname).toLowerCase());
         const mimetype = filetypes.test(file.mimetype);
         if (extname && mimetype) {
             return cb(null, true);
         } else {
-            cb(new Error('الملف يجب أن يكون صورة (jpeg/png) أو صوت (webm)'));
+            cb(new Error('نوع الملف غير مدعوم'));
         }
     }
 });
 
-// مصفوفات مؤقتة لتخزين البيانات
-let rooms = [
-    { id: 1, name: 'الغرفة الرئيسية', description: 'غرفة دردشة عامة', background: null }
-];
+app.post('/api/login', async (req, res) => {
+    try {
+        const { email, password } = req.body;
 
-let users = [
-    { id: 1, display_name: 'Admin', rank: 'admin', role: 'admin', email: 'admin@example.com', password: 'admin', profile_image1: null, profile_image2: null, message_background: null, age: null, gender: null, marital_status: null, about_me: null }
-];
+        const { data: user, error } = await supabase
+            .from('users')
+            .select('*')
+            .eq('email', email)
+            .maybeSingle();
 
-let messages = [];
-let privateMessages = [];
-let news = [];
-let stories = [];
-let bans = [];
-let mutes = [];
-let floodProtection = new Map(); // لحماية من الفيضانات
-let competitions = [];
-let comments = [];
+        if (error || !user) {
+            return res.status(401).json({ error: 'بيانات تسجيل الدخول غير صحيحة' });
+        }
 
-// API لتسجيل الدخول
-app.post('/api/login', (req, res) => {
-    const { email, password } = req.body;
-    const user = users.find(u => u.email === email && u.password === password);
-    if (user) {
-        const token = 'fake-token-' + user.id;
+        if (user.password !== password) {
+            return res.status(401).json({ error: 'كلمة المرور غير صحيحة' });
+        }
+
+        const { data: banData } = await supabase
+            .from('bans')
+            .select('*')
+            .eq('user_id', user.id)
+            .gt('expires_at', new Date().toISOString())
+            .maybeSingle();
+
+        if (banData) {
+            return res.status(403).json({
+                error: 'محظور',
+                banned: true,
+                reason: banData.reason,
+                expires_at: banData.expires_at
+            });
+        }
+
+        const token = jwt.sign({ userId: user.id, email: user.email }, JWT_SECRET, { expiresIn: '30d' });
+
+        await supabase
+            .from('users')
+            .update({ last_seen: new Date().toISOString() })
+            .eq('id', user.id);
+
         res.json({ token, user });
-    } else {
-        res.status(401).json({ error: 'بيانات تسجيل الدخول غير صحيحة' });
+    } catch (error) {
+        console.error('خطأ في تسجيل الدخول:', error);
+        res.status(500).json({ error: 'حدث خطأ في الخادم' });
     }
 });
 
-// API لإنشاء حساب
-app.post('/api/register', (req, res) => {
-    const { email, password, display_name } = req.body;
-    if (users.find(u => u.email === email)) {
-        return res.status(400).json({ error: 'البريد الإلكتروني موجود مسبقًا' });
+app.post('/api/register', async (req, res) => {
+    try {
+        const { email, password, display_name } = req.body;
+
+        const { data: existingUser } = await supabase
+            .from('users')
+            .select('id')
+            .eq('email', email)
+            .maybeSingle();
+
+        if (existingUser) {
+            return res.status(400).json({ error: 'البريد الإلكتروني موجود مسبقاً' });
+        }
+
+        const { data: newUser, error } = await supabase
+            .from('users')
+            .insert([{
+                email,
+                password,
+                display_name,
+                rank: 'visitor',
+                role: 'user',
+                coins: 2000
+            }])
+            .select()
+            .single();
+
+        if (error) {
+            return res.status(500).json({ error: 'فشل إنشاء الحساب' });
+        }
+
+        const token = jwt.sign({ userId: newUser.id, email: newUser.email }, JWT_SECRET, { expiresIn: '30d' });
+
+        res.json({ token, user: newUser });
+    } catch (error) {
+        console.error('خطأ في التسجيل:', error);
+        res.status(500).json({ error: 'حدث خطأ في الخادم' });
     }
-    const newUser = {
-        id: users.length + 1,
-        email,
-        password,
-        display_name,
-        rank: 'visitor',
-        role: 'user',
-        profile_image1: null,
-        profile_image2: null,
-        message_background: null,
-        age: null,
-        gender: null,
-        marital_status: null,
-        about_me: null
-    };
-    users.push(newUser);
-    const token = 'fake-token-' + newUser.id;
-    res.json({ token, user: newUser });
 });
 
-// API للحصول على بيانات الملف الشخصي
-app.get('/api/user/profile', (req, res) => {
-    const token = req.headers.authorization?.split(' ')[1];
-    const user = users.find(u => 'fake-token-' + u.id === token);
-    if (user) res.json(user);
-    else res.status(401).json({ error: 'غير مصرح له' });
+app.post('/api/guest-login', async (req, res) => {
+    try {
+        const { name, age, gender } = req.body;
+
+        const guestEmail = `guest_${Date.now()}@temp.com`;
+        const guestPassword = Math.random().toString(36).substring(7);
+
+        const { data: newUser, error } = await supabase
+            .from('users')
+            .insert([{
+                email: guestEmail,
+                password: guestPassword,
+                display_name: name,
+                age: parseInt(age),
+                gender,
+                rank: 'visitor',
+                role: 'guest',
+                coins: 500
+            }])
+            .select()
+            .single();
+
+        if (error) {
+            return res.status(500).json({ error: 'فشل إنشاء حساب الزائر' });
+        }
+
+        const token = jwt.sign({ userId: newUser.id, email: newUser.email }, JWT_SECRET, { expiresIn: '1d' });
+
+        res.json({ token, user: newUser });
+    } catch (error) {
+        console.error('خطأ في دخول الزائر:', error);
+        res.status(500).json({ error: 'حدث خطأ في الخادم' });
+    }
 });
 
-// API لتحديث الملف الشخصي
-app.put('/api/user/profile', upload.fields([
+const authMiddleware = async (req, res, next) => {
+    try {
+        const token = req.headers.authorization?.split(' ')[1];
+        if (!token) {
+            return res.status(401).json({ error: 'غير مصرح' });
+        }
+
+        const decoded = jwt.verify(token, JWT_SECRET);
+        const { data: user } = await supabase
+            .from('users')
+            .select('*')
+            .eq('id', decoded.userId)
+            .single();
+
+        if (!user) {
+            return res.status(401).json({ error: 'غير مصرح' });
+        }
+
+        req.user = user;
+        next();
+    } catch (error) {
+        res.status(401).json({ error: 'غير مصرح' });
+    }
+};
+
+app.get('/api/user/profile', authMiddleware, async (req, res) => {
+    res.json(req.user);
+});
+
+app.put('/api/user/profile', authMiddleware, upload.fields([
     { name: 'profileImage1', maxCount: 1 },
     { name: 'profileImage2', maxCount: 1 },
+    { name: 'coverImage', maxCount: 1 },
     { name: 'messageBackground', maxCount: 1 }
-]), (req, res) => {
-    const token = req.headers.authorization?.split(' ')[1];
-    const user = users.find(u => 'fake-token-' + u.id === token);
-    if (!user) return res.status(401).json({ error: 'غير مصرح له' });
+]), async (req, res) => {
+    try {
+        const updates = {};
 
-    const { display_name, age, gender, marital_status, about_me } = req.body;
-    if (display_name) user.display_name = display_name;
-    if (age) user.age = parseInt(age);
-    if (gender) user.gender = gender;
-    if (marital_status) user.marital_status = marital_status;
-    if (about_me) user.about_me = about_me;
+        if (req.body.display_name) updates.display_name = req.body.display_name;
+        if (req.body.age) updates.age = parseInt(req.body.age);
+        if (req.body.gender) updates.gender = req.body.gender;
+        if (req.body.marital_status) updates.marital_status = req.body.marital_status;
+        if (req.body.about_me) updates.about_me = req.body.about_me;
+        if (req.body.name_color) updates.name_color = req.body.name_color;
+        if (req.body.font_color) updates.font_color = req.body.font_color;
+        if (req.body.name_decoration) updates.name_decoration = req.body.name_decoration;
 
-    if (req.files['profileImage1']) user.profile_image1 = `/Uploads/${req.files['profileImage1'][0].filename}`;
-    if (req.files['profileImage2']) user.profile_image2 = `/Uploads/${req.files['profileImage2'][0].filename}`;
-    if (req.files['messageBackground']) user.message_background = `/Uploads/${req.files['messageBackground'][0].filename}`;
+        if (req.files['profileImage1']) updates.profile_image1 = `/uploads/${req.files['profileImage1'][0].filename}`;
+        if (req.files['profileImage2']) updates.profile_image2 = `/uploads/${req.files['profileImage2'][0].filename}`;
+        if (req.files['coverImage']) updates.cover_image = `/uploads/${req.files['coverImage'][0].filename}`;
+        if (req.files['messageBackground']) updates.message_background = `/uploads/${req.files['messageBackground'][0].filename}`;
 
-    res.json(user);
-    io.emit('userUpdated', user);
-});
+        const { data: updatedUser, error } = await supabase
+            .from('users')
+            .update(updates)
+            .eq('id', req.user.id)
+            .select()
+            .single();
 
-// API للحصول على قائمة الغرف
-app.get('/api/rooms', (req, res) => res.json(rooms));
+        if (error) {
+            return res.status(500).json({ error: 'فشل تحديث الملف الشخصي' });
+        }
 
-// API لإنشاء غرفة جديدة
-app.post('/api/rooms', upload.single('roomBackground'), (req, res) => {
-    const token = req.headers.authorization?.split(' ')[1];
-    const user = users.find(u => 'fake-token-' + u.id === token);
-    if (!user || user.role !== 'admin') return res.status(403).json({ error: 'غير مسموح' });
-
-    const { name, description } = req.body;
-    const background = req.file ? `/Uploads/${req.file.filename}` : null;
-    const newRoom = { id: rooms.length + 1, name, description, background };
-    rooms.push(newRoom);
-    io.emit('roomCreated', newRoom);
-    res.json(newRoom);
-});
-
-// API لحذف غرفة
-app.delete('/api/rooms/:id', (req, res) => {
-    const token = req.headers.authorization?.split(' ')[1];
-    const user = users.find(u => 'fake-token-' + u.id === token);
-    if (!user || user.role !== 'admin') return res.status(403).json({ error: 'غير مسموح' });
-
-    const roomId = parseInt(req.params.id);
-    rooms = rooms.filter(r => r.id !== roomId);
-    io.emit('roomDeleted', roomId);
-    res.json({ message: 'تم حذف الغرفة' });
-});
-
-// API للحصول على رسائل الغرفة
-app.get('/api/messages/:roomId', (req, res) => {
-    res.json(messages.filter(m => m.roomId === parseInt(req.params.roomId)));
-});
-
-// API للحصول على الرسائل الخاصة
-app.get('/api/private-messages/:userId', (req, res) => {
-    const token = req.headers.authorization?.split(' ')[1];
-    const current = users.find(u => 'fake-token-' + u.id === token);
-    if (!current) return res.status(401).json({ error: 'غير مصرح له' });
-
-    res.json(privateMessages.filter(pm => 
-        (pm.senderId === current.id && pm.receiverId === parseInt(req.params.userId)) || 
-        (pm.senderId === parseInt(req.params.userId) && pm.receiverId === current.id)
-    ));
-});
-
-// API للحصول على الأخبار
-app.get('/api/news', (req, res) => {
-    res.json(news);
-});
-
-// API لنشر خبر جديد
-app.post('/api/news', upload.single('newsFile'), (req, res) => {
-    const token = req.headers.authorization?.split(' ')[1];
-    const user = users.find(u => 'fake-token-' + u.id === token);
-    if (!user) return res.status(401).json({ error: 'غير مصرح له' });
-
-    const { content } = req.body;
-    if (!content && !req.file) return res.status(400).json({ error: 'يجب إدخال محتوى أو ملف' });
-
-    const media = req.file ? `/Uploads/${req.file.filename}` : null;
-    const newNews = {
-        id: news.length + 1,
-        content,
-        media,
-        user_id: user.id,
-        display_name: user.display_name,
-        timestamp: new Date(),
-        likes: []
-    };
-    news.push(newNews);
-    io.emit('newNews', newNews);
-    res.json(newNews);
-});
-
-// API للحصول على الستوريات
-app.get('/api/stories', (req, res) => {
-    res.json(stories.filter(s => new Date() - new Date(s.timestamp) < 24 * 60 * 60 * 1000));
-});
-
-// API لنشر ستوري جديد
-app.post('/api/stories', upload.single('storyImage'), (req, res) => {
-    const token = req.headers.authorization?.split(' ')[1];
-    const user = users.find(u => 'fake-token-' + u.id === token);
-    if (!user) return res.status(401).json({ error: 'غير مصرح له' });
-
-    const image = req.file ? `/Uploads/${req.file.filename}` : null;
-    if (!image) return res.status(400).json({ error: 'يجب رفع صورة' });
-
-    const newStory = {
-        id: stories.length + 1,
-        image,
-        user_id: user.id,
-        display_name: user.display_name,
-        timestamp: new Date()
-    };
-    stories.push(newStory);
-    io.emit('newStory', newStory);
-    res.json(newStory);
-});
-
-// API للتعليقات
-app.post('/api/comments', (req, res) => {
-    const token = req.headers.authorization?.split(' ')[1];
-    const user = users.find(u => 'fake-token-' + u.id === token);
-    if (!user) return res.status(401).json({ error: 'غير مصرح له' });
-
-    const { postId, content, targetUserId } = req.body;
-    const newComment = {
-        id: comments.length + 1,
-        postId: parseInt(postId),
-        content,
-        user_id: user.id,
-        display_name: user.display_name,
-        targetUserId: targetUserId ? parseInt(targetUserId) : null,
-        timestamp: new Date()
-    };
-    comments.push(newComment);
-
-    // إرسال إشعار للمستخدم المستهدف
-    if (targetUserId) {
-        io.emit('newComment', { ...newComment, targetUserId });
+        io.emit('userUpdated', updatedUser);
+        res.json(updatedUser);
+    } catch (error) {
+        console.error('خطأ في تحديث الملف الشخصي:', error);
+        res.status(500).json({ error: 'حدث خطأ في الخادم' });
     }
-
-    res.json(newComment);
 });
 
-// API للحصول على التعليقات
-app.get('/api/comments/:postId', (req, res) => {
-    const postComments = comments.filter(c => c.postId === parseInt(req.params.postId));
-    res.json(postComments);
+app.get('/api/rooms', async (req, res) => {
+    try {
+        const { data: rooms, error } = await supabase
+            .from('rooms')
+            .select('*')
+            .order('created_at', { ascending: true });
+
+        if (error) throw error;
+        res.json(rooms);
+    } catch (error) {
+        console.error('خطأ في جلب الغرف:', error);
+        res.status(500).json({ error: 'حدث خطأ في الخادم' });
+    }
 });
 
-// API للمسابقات
-app.post('/api/competitions', (req, res) => {
-    const token = req.headers.authorization?.split(' ')[1];
-    const user = users.find(u => 'fake-token-' + u.id === token);
-    if (!user || user.role !== 'admin') return res.status(403).json({ error: 'غير مسموح' });
+app.post('/api/rooms', authMiddleware, upload.single('background'), async (req, res) => {
+    try {
+        if (req.user.role !== 'owner' && req.user.role !== 'admin') {
+            return res.status(403).json({ error: 'غير مسموح' });
+        }
 
-    const { title, duration } = req.body;
-    const newCompetition = {
-        id: competitions.length + 1,
-        title,
-        duration: parseInt(duration),
-        startTime: new Date(),
-        active: true
-    };
-    competitions.push(newCompetition);
-    io.emit('newCompetition', newCompetition);
-    res.json(newCompetition);
+        const { name, description } = req.body;
+        const background = req.file ? `/uploads/${req.file.filename}` : null;
+
+        const { data: newRoom, error } = await supabase
+            .from('rooms')
+            .insert([{ name, description, background, created_by: req.user.id }])
+            .select()
+            .single();
+
+        if (error) throw error;
+
+        io.emit('roomCreated', newRoom);
+        res.json(newRoom);
+    } catch (error) {
+        console.error('خطأ في إنشاء الغرفة:', error);
+        res.status(500).json({ error: 'حدث خطأ في الخادم' });
+    }
 });
 
-// API لتعيين رتبة
-app.post('/api/assign-rank', (req, res) => {
-    const token = req.headers.authorization?.split(' ')[1];
-    const admin = users.find(u => 'fake-token-' + u.id === token);
-    if (!admin || admin.role !== 'admin') return res.status(403).json({ error: 'غير مسموح' });
+app.delete('/api/rooms/:id', authMiddleware, async (req, res) => {
+    try {
+        if (req.user.role !== 'owner' && req.user.role !== 'admin') {
+            return res.status(403).json({ error: 'غير مسموح' });
+        }
 
-    const { userId, rank, reason } = req.body;
-    const user = users.find(u => u.id === parseInt(userId));
-    if (!user) return res.status(404).json({ error: 'المستخدم غير موجود' });
+        const roomId = parseInt(req.params.id);
 
-    user.rank = rank;
-    res.json({ message: 'تم تعيين الرتبة' });
-    io.emit('userUpdated', user);
+        const { error } = await supabase
+            .from('rooms')
+            .delete()
+            .eq('id', roomId);
+
+        if (error) throw error;
+
+        io.emit('roomDeleted', roomId);
+        res.json({ message: 'تم حذف الغرفة' });
+    } catch (error) {
+        console.error('خطأ في حذف الغرفة:', error);
+        res.status(500).json({ error: 'حدث خطأ في الخادم' });
+    }
 });
 
-// API للحصول على قائمة المستخدمين
-app.get('/api/users', (req, res) => {
-    res.json(users.map(u => ({
-        id: u.id,
-        display_name: u.display_name,
-        rank: u.rank,
-        profile_image1: u.profile_image1,
-        age: u.age,
-        gender: u.gender,
-        marital_status: u.marital_status,
-        about_me: u.about_me
-    })));
+app.get('/api/messages/:roomId', async (req, res) => {
+    try {
+        const { data: messages, error } = await supabase
+            .from('messages')
+            .select(`
+                *,
+                users (display_name, rank, profile_image1)
+            `)
+            .eq('room_id', parseInt(req.params.roomId))
+            .order('created_at', { ascending: true })
+            .limit(100);
+
+        if (error) throw error;
+        res.json(messages);
+    } catch (error) {
+        console.error('خطأ في جلب الرسائل:', error);
+        res.status(500).json({ error: 'حدث خطأ في الخادم' });
+    }
 });
 
-// API للطرد
-app.post('/api/ban', (req, res) => {
-    const token = req.headers.authorization?.split(' ')[1];
-    const admin = users.find(u => 'fake-token-' + u.id === token);
-    if (!admin || admin.role !== 'admin') return res.status(403).json({ error: 'غير مسموح' });
+app.get('/api/users', async (req, res) => {
+    try {
+        const { data: users, error } = await supabase
+            .from('users')
+            .select('id, display_name, rank, role, profile_image1, age, gender, last_seen')
+            .order('last_seen', { ascending: false });
 
-    const { userId, reason, duration } = req.body;
-    const user = users.find(u => u.id === parseInt(userId));
-    if (!user) return res.status(404).json({ error: 'المستخدم غير موجود' });
-
-    const ban = {
-        id: bans.length + 1,
-        user_id: user.id,
-        reason,
-        duration,
-        timestamp: new Date()
-    };
-    bans.push(ban);
-    io.emit('userBanned', { userId: user.id, reason, duration });
-    res.json({ message: 'تم طرد المستخدم' });
+        if (error) throw error;
+        res.json(users);
+    } catch (error) {
+        console.error('خطأ في جلب المستخدمين:', error);
+        res.status(500).json({ error: 'حدث خطأ في الخادم' });
+    }
 });
 
-// API للكتم
-app.post('/api/mute', (req, res) => {
-    const token = req.headers.authorization?.split(' ')[1];
-    const admin = users.find(u => 'fake-token-' + u.id === token);
-    if (!admin || admin.role !== 'admin') return res.status(403).json({ error: 'غير مسموح' });
+app.post('/api/ban', authMiddleware, async (req, res) => {
+    try {
+        if (req.user.role !== 'owner' && req.user.role !== 'admin' && req.user.role !== 'moderator') {
+            return res.status(403).json({ error: 'غير مسموح' });
+        }
 
-    const { userId, reason, duration } = req.body;
-    const user = users.find(u => u.id === parseInt(userId));
-    if (!user) return res.status(404).json({ error: 'المستخدم غير موجود' });
+        const { userId, reason, duration } = req.body;
 
-    const mute = {
-        id: mutes.length + 1,
-        user_id: user.id,
-        reason,
-        duration,
-        timestamp: new Date()
-    };
-    mutes.push(mute);
-    io.emit('userMuted', { userId: user.id, reason, duration });
-    res.json({ message: 'تم كتم المستخدم' });
+        let expiresAt = null;
+        if (duration !== 'permanent') {
+            const durationMap = {
+                '5m': 5 * 60 * 1000,
+                '1h': 60 * 60 * 1000,
+                '24h': 24 * 60 * 60 * 1000,
+                '7d': 7 * 24 * 60 * 60 * 1000
+            };
+            expiresAt = new Date(Date.now() + durationMap[duration]).toISOString();
+        }
+
+        const { data: ban, error } = await supabase
+            .from('bans')
+            .insert([{
+                user_id: userId,
+                banned_by: req.user.id,
+                reason,
+                duration,
+                expires_at: expiresAt
+            }])
+            .select()
+            .single();
+
+        if (error) throw error;
+
+        io.emit('userBanned', { userId, reason, duration });
+        res.json({ message: 'تم حظر المستخدم', ban });
+    } catch (error) {
+        console.error('خطأ في حظر المستخدم:', error);
+        res.status(500).json({ error: 'حدث خطأ في الخادم' });
+    }
 });
 
-// Socket.IO للتواصل الفوري
-io.on('connection', (socket) => {
-    console.log('مستخدم متصل: ' + socket.id);
+app.post('/api/mute', authMiddleware, async (req, res) => {
+    try {
+        if (req.user.role !== 'owner' && req.user.role !== 'admin' && req.user.role !== 'moderator') {
+            return res.status(403).json({ error: 'غير مسموح' });
+        }
 
-    // الانضمام إلى غرفة
+        const { userId, reason, duration } = req.body;
+
+        let expiresAt = null;
+        if (duration !== 'permanent') {
+            const durationMap = {
+                '5m': 5 * 60 * 1000,
+                '1h': 60 * 60 * 1000,
+                '24h': 24 * 60 * 60 * 1000,
+                '7d': 7 * 24 * 60 * 60 * 1000
+            };
+            expiresAt = new Date(Date.now() + durationMap[duration]).toISOString();
+        }
+
+        const { data: mute, error } = await supabase
+            .from('mutes')
+            .insert([{
+                user_id: userId,
+                muted_by: req.user.id,
+                reason,
+                duration,
+                expires_at: expiresAt
+            }])
+            .select()
+            .single();
+
+        if (error) throw error;
+
+        io.emit('userMuted', { userId, reason, duration });
+        res.json({ message: 'تم كتم المستخدم', mute });
+    } catch (error) {
+        console.error('خطأ في كتم المستخدم:', error);
+        res.status(500).json({ error: 'حدث خطأ في الخادم' });
+    }
+});
+
+app.post('/api/assign-rank', authMiddleware, async (req, res) => {
+    try {
+        if (req.user.role !== 'owner' && req.user.role !== 'admin') {
+            return res.status(403).json({ error: 'غير مسموح' });
+        }
+
+        const { userId, rank } = req.body;
+
+        const { data: updatedUser, error } = await supabase
+            .from('users')
+            .update({ rank })
+            .eq('id', userId)
+            .select()
+            .single();
+
+        if (error) throw error;
+
+        io.emit('userUpdated', updatedUser);
+        res.json({ message: 'تم تعيين الرتبة', user: updatedUser });
+    } catch (error) {
+        console.error('خطأ في تعيين الرتبة:', error);
+        res.status(500).json({ error: 'حدث خطأ في الخادم' });
+    }
+});
+
+app.get('/api/news', async (req, res) => {
+    try {
+        const { data: news, error } = await supabase
+            .from('news')
+            .select(`
+                *,
+                users (display_name, rank, profile_image1)
+            `)
+            .order('created_at', { ascending: false })
+            .limit(50);
+
+        if (error) throw error;
+        res.json(news);
+    } catch (error) {
+        console.error('خطأ في جلب الأخبار:', error);
+        res.status(500).json({ error: 'حدث خطأ في الخادم' });
+    }
+});
+
+app.post('/api/news', authMiddleware, upload.single('media'), async (req, res) => {
+    try {
+        const { content } = req.body;
+        const media = req.file ? `/uploads/${req.file.filename}` : null;
+
+        const { data: newNews, error } = await supabase
+            .from('news')
+            .insert([{
+                user_id: req.user.id,
+                content,
+                media
+            }])
+            .select(`
+                *,
+                users (display_name, rank, profile_image1)
+            `)
+            .single();
+
+        if (error) throw error;
+
+        io.emit('newNews', newNews);
+        res.json(newNews);
+    } catch (error) {
+        console.error('خطأ في نشر الأخبار:', error);
+        res.status(500).json({ error: 'حدث خطأ في الخادم' });
+    }
+});
+
+const connectedUsers = new Map();
+const floodProtection = new Map();
+
+io.on('connection', async (socket) => {
+    console.log('مستخدم متصل:', socket.id);
+
+    socket.on('authenticate', async (token) => {
+        try {
+            const decoded = jwt.verify(token, JWT_SECRET);
+            const { data: user } = await supabase
+                .from('users')
+                .select('*')
+                .eq('id', decoded.userId)
+                .single();
+
+            if (user) {
+                socket.user = user;
+                socket.userId = user.id;
+                connectedUsers.set(user.id, socket.id);
+
+                await supabase
+                    .from('users')
+                    .update({ last_seen: new Date().toISOString() })
+                    .eq('id', user.id);
+
+                io.emit('userOnline', { userId: user.id, displayName: user.display_name });
+
+                const onlineUsers = Array.from(connectedUsers.keys());
+                socket.emit('onlineUsers', onlineUsers);
+            }
+        } catch (error) {
+            console.error('خطأ في المصادقة:', error);
+        }
+    });
+
     socket.on('join', (data) => {
         socket.join(data.roomId);
-        socket.user = data;
-        io.emit('userList', users.filter(u => u.id !== socket.user.userId));
+        socket.currentRoom = data.roomId;
     });
 
-    // إرسال رسالة عامة
-    socket.on('sendMessage', (data) => {
-        // فحص الحماية من الفيضانات
-        const userId = socket.user.userId;
-        const now = Date.now();
+    socket.on('sendMessage', async (data) => {
+        try {
+            if (!socket.user) return;
 
-        if (!floodProtection.has(userId)) {
-            floodProtection.set(userId, []);
-        }
+            const userId = socket.user.id;
+            const now = Date.now();
 
-        const userMessages = floodProtection.get(userId);
-        // إزالة الرسائل القديمة (أكثر من 10 ثواني)
-        const recentMessages = userMessages.filter(time => now - time < 10000);
-
-        // إذا أرسل أكثر من 5 رسائل في 10 ثواني
-        if (recentMessages.length >= 5) {
-            const muteEndTime = new Date(now + 5 * 60 * 1000); // 5 دقائق
-            const mute = {
-                id: mutes.length + 1,
-                user_id: userId,
-                reason: 'الفيضانات - رسائل سريعة ومتكررة',
-                duration: '5m',
-                timestamp: new Date(),
-                endTime: muteEndTime
-            };
-            mutes.push(mute);
-
-            // إرسال رسالة للشات عن الكتم
-            const muteMessage = {
-                id: messages.length + 1,
-                roomId: data.roomId,
-                content: `تم كتم ${socket.user.display_name} بسبب الفيضانات`,
-                type: 'system',
-                timestamp: new Date()
-            };
-            messages.push(muteMessage);
-            io.to(data.roomId).emit('newMessage', muteMessage);
-
-            socket.emit('error', 'تم كتمك لمدة 5 دقائق بسبب الرسائل السريعة والمتكررة');
-            return;
-        }
-
-        recentMessages.push(now);
-        floodProtection.set(userId, recentMessages);
-
-        const isMuted = mutes.find(m => m.user_id === socket.user.userId && 
-            (m.duration === 'permanent' || (m.endTime && new Date() < new Date(m.endTime)) || 
-             new Date() - new Date(m.timestamp) < parseDuration(m.duration)));
-        if (isMuted) return socket.emit('error', 'أنت مكتوم ولا يمكنك إرسال الرسائل');
-
-        const message = { 
-            id: messages.length + 1, 
-            roomId: data.roomId, 
-            user_id: socket.user.userId, 
-            display_name: socket.user.display_name, 
-            rank: socket.user.rank, 
-            content: data.content, 
-            type: 'text', 
-            timestamp: new Date() 
-        };
-        messages.push(message);
-        io.to(data.roomId).emit('newMessage', message);
-    });
-
-    // إرسال رسالة خاصة
-    socket.on('sendPrivateMessage', (data) => {
-        const isMuted = mutes.find(m => m.user_id === socket.user.userId && 
-            (m.duration === 'permanent' || new Date() - new Date(m.timestamp) < parseDuration(m.duration)));
-        if (isMuted) return socket.emit('error', 'أنت مكتوم ولا يمكنك إرسال الرسائل');
-
-        const message = { 
-            id: privateMessages.length + 1, 
-            senderId: socket.user.userId, 
-            display_name: socket.user.display_name, 
-            rank: socket.user.rank, 
-            receiverId: data.receiverId, 
-            content: data.content, 
-            type: 'text', 
-            timestamp: new Date() 
-        };
-        privateMessages.push(message);
-        socket.to(data.receiverId).emit('newPrivateMessage', message);
-        socket.emit('newPrivateMessage', message);
-    });
-
-    // إرسال صورة عامة
-    socket.on('sendImage', (data, callback) => {
-        upload.single('image')(data, {}, (err) => {
-            if (err) {
-                console.error('Error uploading image:', err.message);
-                return callback({ error: 'فشل رفع الصورة: ' + err.message });
-            }
-            const isMuted = mutes.find(m => m.user_id === socket.user.userId && 
-                (m.duration === 'permanent' || new Date() - new Date(m.timestamp) < parseDuration(m.duration)));
-            if (isMuted) return callback({ error: 'أنت مكتوم ولا يمكنك إرسال الصور' });
-
-            const imageUrl = `/Uploads/${data.file.filename}`;
-            const message = { 
-                id: messages.length + 1, 
-                image_url: imageUrl, 
-                type: 'image', 
-                roomId: data.roomId, 
-                user_id: socket.user.userId, 
-                display_name: socket.user.display_name, 
-                rank: socket.user.rank, 
-                timestamp: new Date() 
-            };
-            messages.push(message);
-            io.to(data.roomId).emit('newImage', message);
-            callback({ success: true, imageUrl });
-        });
-    });
-
-    // إرسال صورة خاصة
-    socket.on('sendPrivateImage', (data, callback) => {
-        upload.single('image')(data, {}, (err) => {
-            if (err) {
-                console.error('Error uploading private image:', err.message);
-                return callback({ error: 'فشل رفع الصورة: ' + err.message });
-            }
-            const isMuted = mutes.find(m => m.user_id === socket.user.userId && 
-                (m.duration === 'permanent' || new Date() - new Date(m.timestamp) < parseDuration(m.duration)));
-            if (isMuted) return callback({ error: 'أنت مكتوم ولا يمكنك إرسال الصور' });
-
-            const imageUrl = `/Uploads/${data.file.filename}`;
-            const message = { 
-                id: privateMessages.length + 1, 
-                image_url: imageUrl, 
-                type: 'image', 
-                receiverId: data.receiverId, 
-                user_id: socket.user.userId, 
-                display_name: socket.user.display_name, 
-                rank: socket.user.rank, 
-                timestamp: new Date() 
-            };
-            privateMessages.push(message);
-            socket.to(data.receiverId).emit('newPrivateImage', message);
-            socket.emit('newPrivateImage', message);
-            callback({ success: true, imageUrl });
-        });
-    });
-
-    // إرسال رسالة صوتية عامة
-    socket.on('sendVoice', (data, callback) => {
-        upload.single('voice')(data, {}, (err) => {
-            if (err) {
-                console.error('Error uploading voice:', err.message);
-                return callback({ error: 'فشل رفع التسجيل الصوتي: ' + err.message });
-            }
-            const isMuted = mutes.find(m => m.user_id === socket.user.userId && 
-                (m.duration === 'permanent' || new Date() - new Date(m.timestamp) < parseDuration(m.duration)));
-            if (isMuted) return callback({ error: 'أنت مكتوم ولا يمكنك إرسال الرسائل الصوتية' });
-
-            const voiceUrl = `/Uploads/${data.file.filename}`;
-            const message = { 
-                id: messages.length + 1, 
-                voice_url: voiceUrl, 
-                type: 'voice', 
-                roomId: data.roomId, 
-                user_id: socket.user.userId, 
-                display_name: socket.user.display_name, 
-                rank: socket.user.rank, 
-                timestamp: new Date() 
-            };
-            messages.push(message);
-            io.to(data.roomId).emit('newVoice', message);
-            callback({ success: true, voiceUrl });
-        });
-    });
-
-    // إرسال رسالة صوتية خاصة
-    socket.on('sendPrivateVoice', (data, callback) => {
-        upload.single('voice')(data, {}, (err) => {
-            if (err) {
-                console.error('Error uploading private voice:', err.message);
-                return callback({ error: 'فشل رفع التسجيل الصوتي: ' + err.message });
-            }
-            const isMuted = mutes.find(m => m.user_id === socket.user.userId && 
-                (m.duration === 'permanent' || new Date() - new Date(m.timestamp) < parseDuration(m.duration)));
-            if (isMuted) return callback({ error: 'أنت مكتوم ولا يمكنك إرسال الرسائل الصوتية' });
-
-            const voiceUrl = `/Uploads/${data.file.filename}`;
-            const message = { 
-                id: privateMessages.length + 1, 
-                voice_url: voiceUrl, 
-                type: 'voice', 
-                receiverId: data.receiverId, 
-                user_id: socket.user.userId, 
-                display_name: socket.user.display_name, 
-                rank: socket.user.rank, 
-                timestamp: new Date() 
-            };
-            privateMessages.push(message);
-            socket.to(data.receiverId).emit('newPrivateVoice', message);
-            socket.emit('newPrivateVoice', message);
-            callback({ success: true, voiceUrl });
-        });
-    });
-
-    // حذف غرفة
-    socket.on('deleteRoom', (roomId) => {
-        const user = users.find(u => u.id === socket.user.userId);
-        if (user.role === 'admin') {
-            rooms = rooms.filter(r => r.id !== roomId);
-            io.emit('roomDeleted', roomId);
-        }
-    });
-
-    // إرسال إشعار
-    socket.on('sendNotification', (data) => {
-        io.to(data.userId).emit('newNotification', data);
-    });
-
-    // تحميل المنشورات
-    socket.on('loadNewsPosts', () => {
-        socket.emit('loadNewsPosts', news);
-    });
-
-    // نشر خبر جديد
-    socket.on('addNewsPost', (data) => {
-        const user = socket.user;
-        if (!user) return;
-        const isMuted = mutes.find(m => m.user_id === user.userId && 
-            (m.duration === 'permanent' || new Date() - new Date(m.timestamp) < parseDuration(m.duration)));
-        if (isMuted) return socket.emit('error', 'أنت مكتوم ولا يمكنك نشر الأخبار');
-
-        const newNews = {
-            id: news.length + 1,
-            content: data.content,
-            media: data.media,
-            user_id: user.userId,
-            display_name: user.display_name,
-            timestamp: new Date(),
-            likes: []
-        };
-        news.push(newNews);
-        io.emit('updateNewsPost', newNews);
-    });
-
-    // إضافة تفاعل
-    socket.on('addReaction', (data) => {
-        const user = socket.user;
-        if (!user) return;
-        const post = news.find(n => n.id === parseInt(data.postId));
-        if (post) {
-            if (!post.reactions) post.reactions = { likes: [], dislikes: [], hearts: [] };
-
-            // إزالة التفاعل السابق للمستخدم
-            Object.keys(post.reactions).forEach(reactionType => {
-                post.reactions[reactionType] = post.reactions[reactionType].filter(r => r.user_id !== user.userId);
-            });
-
-            // إضافة التفاعل الجديد
-            if (data.type === 'like') {
-                post.reactions.likes.push({ user_id: user.userId, display_name: user.display_name });
-            } else if (data.type === 'dislike') {
-                post.reactions.dislikes.push({ user_id: user.userId, display_name: user.display_name });
-            } else if (data.type === 'heart') {
-                post.reactions.hearts.push({ user_id: user.userId, display_name: user.display_name });
+            if (!floodProtection.has(userId)) {
+                floodProtection.set(userId, []);
             }
 
-            io.emit('updateNewsPost', post);
+            const userMessages = floodProtection.get(userId);
+            const recentMessages = userMessages.filter(time => now - time < 10000);
+
+            if (recentMessages.length >= 5) {
+                const expiresAt = new Date(now + 5 * 60 * 1000).toISOString();
+                await supabase.from('mutes').insert([{
+                    user_id: userId,
+                    muted_by: userId,
+                    reason: 'الفيضانات - رسائل سريعة ومتكررة',
+                    duration: '5m',
+                    expires_at: expiresAt
+                }]);
+
+                socket.emit('error', 'تم كتمك لمدة 5 دقائق بسبب الرسائل السريعة والمتكررة');
+                return;
+            }
+
+            recentMessages.push(now);
+            floodProtection.set(userId, recentMessages);
+
+            const { data: mute } = await supabase
+                .from('mutes')
+                .select('*')
+                .eq('user_id', userId)
+                .or(`duration.eq.permanent,expires_at.gt.${new Date().toISOString()}`)
+                .maybeSingle();
+
+            if (mute) {
+                return socket.emit('error', 'أنت مكتوم ولا يمكنك إرسال الرسائل');
+            }
+
+            const { data: message, error } = await supabase
+                .from('messages')
+                .insert([{
+                    room_id: data.roomId,
+                    user_id: userId,
+                    content: data.content,
+                    type: 'text'
+                }])
+                .select(`
+                    *,
+                    users (display_name, rank, profile_image1)
+                `)
+                .single();
+
+            if (error) throw error;
+
+            io.to(data.roomId).emit('newMessage', message);
+        } catch (error) {
+            console.error('خطأ في إرسال الرسالة:', error);
         }
     });
 
-    // إضافة تعليق
-    socket.on('addComment', (data) => {
-        const user = socket.user;
-        if (!user) return;
+    socket.on('sendPrivateMessage', async (data) => {
+        try {
+            if (!socket.user) return;
 
-        const newComment = {
-            id: comments.length + 1,
-            postId: parseInt(data.postId),
-            content: data.content,
-            user_id: user.userId,
-            display_name: user.display_name,
-            targetUserId: data.targetUserId ? parseInt(data.targetUserId) : null,
-            timestamp: new Date()
-        };
-        comments.push(newComment);
+            const { data: message, error } = await supabase
+                .from('private_messages')
+                .insert([{
+                    sender_id: socket.user.id,
+                    receiver_id: data.receiverId,
+                    content: data.content,
+                    type: 'text'
+                }])
+                .select()
+                .single();
 
-        // إرسال التعليق للجميع
-        io.emit('newComment', newComment);
+            if (error) throw error;
 
-        // إرسال إشعار للمستخدم المستهدف
-        if (data.targetUserId) {
-            io.to(data.targetUserId).emit('commentNotification', {
-                from: user.display_name,
-                content: data.content,
-                postId: data.postId
-            });
+            const receiverSocketId = connectedUsers.get(data.receiverId);
+            if (receiverSocketId) {
+                io.to(receiverSocketId).emit('newPrivateMessage', message);
+            }
+
+            socket.emit('newPrivateMessage', message);
+        } catch (error) {
+            console.error('خطأ في إرسال رسالة خاصة:', error);
         }
     });
 
-    // إيقاف المسابقة
-    socket.on('stopCompetition', (competitionId) => {
-        const competition = competitions.find(c => c.id === parseInt(competitionId));
-        if (competition) {
-            competition.active = false;
-            io.emit('competitionStopped', competitionId);
-        }
-    });
+    socket.on('disconnect', async () => {
+        if (socket.user) {
+            connectedUsers.delete(socket.user.id);
 
-    // فصل الاتصال
-    socket.on('disconnect', () => {
-        console.log('مستخدم منفصل: ' + socket.id);
-        io.emit('userList', users.filter(u => u.id !== socket.user?.userId));
+            await supabase
+                .from('users')
+                .update({ last_seen: new Date().toISOString() })
+                .eq('id', socket.user.id);
+
+            io.emit('userOffline', { userId: socket.user.id });
+        }
+        console.log('مستخدم منفصل:', socket.id);
     });
 });
 
-// دالة مساعدة لتحويل مدة الكتم/الطرد إلى ميلي ثانية
-function parseDuration(duration) {
-    const map = {
-        '5m': 5 * 60 * 1000,
-        '1h': 60 * 60 * 1000,
-        '24h': 24 * 60 * 60 * 1000,
-        '7d': 7 * 24 * 60 * 60 * 1000,
-        'permanent': Infinity
-    };
-    return map[duration] || 0;
-}
-
-// تنظيف الحماية من الفيضانات كل دقيقة
 setInterval(() => {
     const now = Date.now();
     for (const [userId, messages] of floodProtection.entries()) {
@@ -695,18 +650,7 @@ setInterval(() => {
     }
 }, 60000);
 
-// تنظيف الكتم المنتهي
-setInterval(() => {
-    const now = new Date();
-    mutes = mutes.filter(mute => {
-        if (mute.endTime && now > new Date(mute.endTime)) {
-            return false;
-        }
-        return true;
-    });
-}, 30000);
+app.use(express.static(__dirname));
 
-// تشغيل الخادم
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
-```
+server.listen(PORT, () => console.log(`🦂 شات وتين العقرب يعمل على المنفذ ${PORT}`));
